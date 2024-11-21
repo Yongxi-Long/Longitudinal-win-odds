@@ -1,57 +1,150 @@
-# corstr a character string specifying the correlation
-#'     structure. The following are permitted: '"independence"',
-#'     '"exchangeable"', '"ar1"', '"unstructured"' and '"userdefined"'
-# std.err para is disabled because this way we only take into account
-#' temporal correlation not pairwise correlation
-#' # scale.fix Omitting this argument and allowing gee to estimate the scale parameter generates a quasibinomial model,
-#' #  which is an adjustment for overdispersion. Because binary data cannot be overdispersed, 
-#' # a quasibinomial model is never appropriate for binary data. 
+
+#' @title longitudinal win odds
+#' @description
+#' function for fitting a longitudinal probabilistic index model with logit link
+#' to get longitudinal win odds
+#' @param formula formula 
+#' @param data data frame containing relevant variables
+#' @param family family of the link function, only logit link gives win odds
+#' @param id name of the column that contains cluster id. For example, patient id for repeated measurements on the same patient
+#' Data are assumed to be sorted so that observations on each cluster appear as contiguous rows in data. If data is not sorted this way,
+#'  the function will not identify the clusters correctly. 
+#' @param visit name of the column that contains visit within each cluster. We need this because subjects forming a pair must come from the same visit
+#' @param time.varname (scalar or vector of) variable names that represent time in the formula. This is IMPORTANT because
+#' time variable will not be converted into pair level. 
+#' @param corstr working correlation structure, one of "independence"', '"exchangeable"', '"ar1"', '"unstructured"' and '"userdefined"'
+#' @param zcor Used for entering a user defined working correlation structure.
+#' @param weights weight for each observation
 #' @import geepack
 #' @export lwo
-lwo <- function (formula, family = binomial(), data = parent.frame(), 
-                  group, id_pair,id1,id2,corstr = "independence", 
-          weights,subset,na.action, start = NULL, etastart, mustart, 
-          offset, control = geese.control(...), method = "glm.fit", 
-          contrasts = NULL, waves = NULL, 
-          zcor = NULL, scale.fix = TRUE, 
-          scale.value = 1,std.err="san.se", ...) 
+lwo <- function (formula, 
+                  data = parent.frame(), 
+                  family = binomial(),
+                  id,
+                  visit,
+                  time.varname = NULL,
+                  corstr = "independence", 
+                  weights,subset,na.action, start = NULL, etastart, mustart, 
+                  offset, control = geese.control(...), method = "glm.fit", 
+                  contrasts = NULL, waves = NULL, 
+                  zcor = NULL, scale.fix = TRUE, 
+                  scale.value = 1,std.err="san.se", ...) 
 {
-  ##---- Prepare model matrix and response vector
-  # returns a call in which all of the specified arguments are specified by their full names.
-  # expand.dot: logical. Should arguments matching ... in the call be included or left as a ... argument?
   if (missing(data)) 
-  data <- environment(formula)
+    data <- environment(formula) #If data is not explicitly provided, R uses the environment in which the formula was created to find the variables (e.g., the global environment or a specific data frame).
+  ##---- Prepare model matrix and response vector
+  # returns a full call to the function. e.g., glm(formula = y~x data=df, family = binomial())
+  # expand.dot: expands any ... arguments to include all their contents explicitly. This is useful for saving the full call for reproducing results or diagnostics.
   call <- match.call(expand.dots = TRUE)
-  mf <- match.call(expand.dots = FALSE)
+  mf.call <- match.call(expand.dots = FALSE)
   # find position of the following terms in mf
-  m <- match(c("formula", "data","id_pair","id1","id2","group",
-               "subset", "weights", "na.action", 
-               "etastart", "mustart", "offset"), names(mf), 0L)
+  m <- match(c("formula", 
+               "data",
+               #   "id",
+               #   "visit",
+               #   "time",
+               "subset", "weights", "na.action",
+               "etastart", "mustart", "offset"), names(mf.call), 0L) # returns 0 if not the term is not inputted
   # reduce mf to only contain the above terms
-  mf <- mf[c(1L, m)]
-  mf$drop.unused.levels <- TRUE
-  mf[[1L]] <- quote(stats::model.frame)
-  # mf is the model data frame
-  mf <- eval(mf, parent.frame())
+  mf.call <- mf.call[c(1L, m)] #c(1L, m) ensures the function name (first element) and the matched arguments are retained.
+  # Other arguments, such as family or additional parameters, are excluded temporarily.
+  mf.call$drop.unused.levels <- TRUE # If factors in the data frame have levels not present in the subset used for modeling, this avoids errors or inconsistencies during the fitting process.
+  # The first element of mf (which was previously the function name, e.g., lwo) is replaced with stats::model.frame.
+  # stats::model.frame(formula = y ~ x, data = df, ...)
+  mf.call[[1L]] <- quote(stats::model.frame)
   
-  ##---- Construct X and Y
+  # mf is the model frame
+  # eval() executes the stats::model.frame() call in the appropriate context (parent.frame()), producing the model frame (mf).
+  # The model frame includes the response variable, predictors, and any weights, offsets, or subsets specified in the arguments.
+  mf <- eval(mf.call, parent.frame())
+  # stats::model.frame() attaches a "terms" attribute to the resulting model frame. This "terms" object contains detailed information about the model formula, such as:
+  # The response and predictor variables.
+  # Their roles (response vs. predictors).
+  # Any interactions or transformations specified in the formula.
+  # mt is used later in the fitting process to handle predictors correctly.
   mt <- attr(mf, "terms")
-  Y  <- model.response(mf, "numeric")
-  N <- NROW(Y)
-  X  <- if (!is.empty.model(mt)) 
+  # return(list(mf,mt))
+  
+  ################################################################################
+  # Create new data frame from input dataframe: convert outcome and covariate to pair level        
+  ################################################################################
+  # we need input id name and time name, because time variable will not be converted to pair level
+  relevant_vars <- extract_variable_names(formula)
+  outcome.label <- relevant_vars[1]
+  covariate.labels <-  relevant_vars[2:length(relevant_vars)]
+  
+  # only form pairs at the same visit, not from different visits
+  # list of all possible pairs
+  tab <- table(data[,id],data[,visit])
+  #table(mf[,"(id)"],mf[,"(visit)"]) # this records whether jth visit of ith subject is missing
+  all.possible.pairs <- data.frame(t(combn(as.numeric(rownames(tab)),2)))
+  colnames(all.possible.pairs) <- c("L","R")
+  meet <- apply(all.possible.pairs,1,function(i)
   {
-    model.matrix(mt, mf, contrasts)
+    # add the appearance indicator of two individuals for all visits
+    # if no element is 2, then they never meet
+    meet <- any(tab[i["L"],] + tab[i["R"],]==2)
+    return(meet)
+  })
+  all.pairs <- all.possible.pairs[meet,]
+  all.pairs$pair.id <- 1:nrow(all.pairs)
+  
+  # now for each visit, make pseudo variable values on the pair level
+  # see how many visits are there
+  visits <- unique(data[,visit])[order(unique(data[,visit]))]
+  temp <- sapply(visits,function(i)
+  {
+    data.this.visit <- data[data[,visit]==i,]
+    # see which pairs can be formed at this visit
+    pairs.this.visit <- intersect(which(all.pairs$L %in% data.this.visit[,id]),
+                                  which(all.pairs$R %in% data.this.visit[,id]))
+    dat.pairs.this.visit <- all.pairs[pairs.this.visit,]
+    # get information from subject 1 
+    dat.L <- dplyr::left_join(dat.pairs.this.visit,
+                              dplyr::select(data.this.visit,all_of(c(id,relevant_vars))),
+                              by=c("L"=id))
+    # get information from subject 2
+    dat.R <- dplyr::left_join(dat.pairs.this.visit,
+                              dplyr::select(data.this.visit,all_of(c(id,relevant_vars))),
+                              by=c("R"=id))
+    # calculate pseudo variable values as the difference between subject 1 (left) and subject 2 (right): right - left always
+    dat.RminusL <- dat.R - dat.L 
+    dat.RminusL <- dplyr::select(dat.RminusL,-c("L","R","pair.id"))
+    
+    # convert pair level outcome to either a win (1), a tie (0.5) or a loss (0)
+    dat.RminusL[,outcome.label] <- 0.5*(dat.RminusL[,outcome.label]==0) + 1*(dat.RminusL[,outcome.label] > 0)
+    
+    
+    # We should not convert time variable to pair difference, because we only form pairs with subjects
+    # at the same time/visit, so pair level time variable is always zero
+    # use the mean value of time between left and right subject
+    dat.RminusL[,time.varname] <- (dat.L[,time.varname]+dat.R[,time.varname])/2
+    dat.comb <- cbind(dat.pairs.this.visit,dat.RminusL)
+    return(dat.comb)
+  },simplify=FALSE)
+  data.pair <- dplyr::bind_rows(temp)
+  data.pair <- data.pair[order(data.pair$pair.id),]
+  ##---- Modify model framework mf
+  # since we have converted data frame from individual level to pair level
+  # we have to modify the model framework accordingly
+  mf.pair <- model.frame(formula, data.pair, drop.unused.levels = TRUE)
+  mt.pair <- terms(mf.pair)
+  
+  ##---- Construct X and Y 
+  Y  <- model.response(mf.pair, "numeric")
+  N <- NROW(Y) # number of pairs
+  X  <- if (!is.empty.model(mt.pair)) 
+  {
+    model.matrix(mt.pair, mf.pair, contrasts)
   }else 
-  {matrix(, NROW(Y), 0)}
-  # if user specify no intercept by add -1, then do nothing, otherwise need to change
-  # individual level intercept to pair level intercept: 1 between group pair and 0 within group pair
-  if (colnames(X)[1]=="(Intercept)")
-  {
-    group <- model.extract(mf,group)
-    X[,1] <- group
-    colnames(X)[1] <- "(Intercept.pair)"
-  }
-
+  {matrix(, N, 0)}
+  # remove intercept
+  X <- X[,colnames(X)!="(Intercept)"]
+  
+  ##---- Clustering variable
+  id.pair <- data.pair[,"pair.id"]
+  if (is.null(id.pair)) stop("pair id variable not found.")
+  
   ##---- Get family, for longitudinal win odds, only logit link is valid
   if (is.character(family)) 
     family <- get(family, mode = "function", envir = parent.frame())
@@ -59,7 +152,7 @@ lwo <- function (formula, family = binomial(), data = parent.frame(),
     family <- family()
   if (is.null(family$family)) {
     print(family)
-    stop("'family' not recognized")
+    stop("'family not recognized")
   }
   if (family$family!="binomial")
   {
@@ -68,7 +161,7 @@ lwo <- function (formula, family = binomial(), data = parent.frame(),
   
   ##---- Match method, can only return model data frame if user inputs "model.frame"
   if (identical(method, "model.frame")) 
-    return(mf)
+    return(mf.pair)
   if (!is.character(method) && !is.function(method)) 
     stop("invalid 'method' argument")
   if (identical(method, "glm.fit")) 
@@ -84,19 +177,15 @@ lwo <- function (formula, family = binomial(), data = parent.frame(),
   corstrv <- pmatch(corstr, CORSTRS, -1)
   corstr  <- CORSTRS[corstrv]
   
-  ##---- Clustering variable
-  id_pair <- model.extract(mf, id_pair)
-  if (is.null(id_pair)) stop("pair id variable not found.")
-  
-  ##---- Waves
+  ##---- Waves (not used)
   waves <- model.extract(mf, waves)
   if (!is.null(waves)) waves <- as.factor(waves)
   
-  ##---- Weights for the observations
+  ##---- Weights for the observations (not used)
   weights <- model.weights(mf)
   if (is.null(weights)) weights <- rep(1, N)
   
-  ##---- Offset for the mean and the scale
+  ##---- Offset for the mean and the scale (not used)
   offset <- model.offset(mf)
   if (is.null(offset)) offset <- rep(0, N)
   soffset <- rep(0, N)
@@ -122,43 +211,46 @@ lwo <- function (formula, family = binomial(), data = parent.frame(),
   
   ##---- Create dummy glm object in order for the model to fit in generic functions that have glm method
   glmFit <- glm.fit(x = X, y = Y, weights = rep(1,N), start = NULL, etastart = NULL, 
-                      mustart = NULL, offset = rep(0,N), family = binomial(), 
-                      control = list(), intercept = TRUE, singular.ok = TRUE)
+                    mustart = NULL, offset = rep(0,N), family = binomial(), 
+                    control = list(), intercept = TRUE, singular.ok = TRUE)
   class(glmFit) <- "glm"
-  glmFit$terms <- mt
-  glmFit$model <- mf
-  modelmat <- model.matrix(glmFit)
-  qqrr     <- qr(modelmat)
-  if (qqrr$rank < ncol(modelmat)){
-    print(head(modelmat))
-    stop("Model matrix is rank deficient; geeglm can not proceed\n")
-  }
+  glmFit$terms <- mt.pair
+  glmFit$model <- mf.pair
+  # modelmat <- model.matrix(glmFit)[-1] # no intercept
+  # qqrr     <- qr(modelmat)
+  # if (qqrr$rank < ncol(modelmat)){
+  #   print(head(modelmat))
+  #   stop("Model matrix is rank deficient; geeglm can not proceed\n")
+  # }
   
-  ans <- geese.fit(x=X, y=Y, id=id_pair, offset=offset, soffset=soffset,
-                   weights=weights, waves = waves, 
-                   zcor = zcor, corp = NULL, control = control, b = NULL, 
-                   alpha = NULL, gm = NULL, family=family, mean.link = NULL, variance = NULL, 
+  ##---- Use geese.fit to estimate parameters, the variances are wrong which will be 
+  # fixed later
+  ans <- geese.fit(x=X, y=Y, id=id.pair, 
+                   family=family,
+                   corstr=corstr,zcor = zcor,
+                   offset=offset, soffset=soffset,
+                   weights=weights, waves = waves, control = control, 
+                   corp = NULL, b = NULL, 
+                   alpha = NULL, gm = NULL,  mean.link = NULL, variance = NULL, 
                    cor.link = "identity", sca.link = "identity", link.same = TRUE, 
-                   scale.fix = scale.fix, scale.value = 1, corstr=corstr)
+                   scale.fix = scale.fix, scale.value = 1)
   ans <- c(ans, list(call = call, formula = formula))
   class(ans)  <- "geese"
-  ans$X       <- X
-  ans$id_pair <- id_pair
-  ans$weights <- weights
-  
-  #####################################################
+  ans$model.matrix <- X
+  ans$id.pair <- id.pair
+  # return(ans)
+  ################################################################################
   # update to geese, modify the standard error vbeta
-  #####################################################
+  ################################################################################
   # extract U evaluated at estimated regression coefs
-  # N_pairs <- choose(N,2) # not necessarily if missed visits, some individuals never meet
-  N_pairs <- length(unique(id_pair))
+  N_pairs <- length(unique(id.pair))
   betas_hat <- c(ans$beta)
   rho_hat <- ans$alpha
   x <- X
   y <- Y
   # fitted values
   mu <- plogis(c(x%*%betas_hat))
-  num_visits_per_pair <- c(table(id_pair))
+  num_visits_per_pair <- c(table(id.pair))
   # list of inverse of the correlation matrix, for every subject, number of visits may vary under missing data
   R_inv_list <- sapply(1:max(num_visits_per_pair), function(n)
   {
@@ -222,13 +314,9 @@ lwo <- function (formula, family = binomial(), data = parent.frame(),
   # use matrix multiplication, much faster
   # IDs for subject 1 and subject 2 in each pair
   # make pair identifier data frame
-  pair_df <- data.frame(
-    ID_subject1 = model.extract(mf,id1),
-    ID_subject2 = model.extract(mf,id2),
-    pair_ID = id_pair
-  )
-  IDs_subject1 <- unique(pair_df[,c("ID_subject1","pair_ID")])[,"ID_subject1"]
-  IDs_subject2 <- unique(pair_df[,c("ID_subject2","pair_ID")])[,"ID_subject2"]
+  pair_df <- dplyr::select(data.pair,c("L","R","pair.id"))
+  IDs_subjectL <- unique(pair_df[,c("L","pair.id")])[,"L"]
+  IDs_subjectR <- unique(pair_df[,c("R","pair.id")])[,"R"]
   # correlated pairs like (1,2) and (1,3), shared subject is on the same side
   shared.factor=1
   # correlated pairs like (1,2) and (2,4), shared subject is on either side
@@ -236,12 +324,12 @@ lwo <- function (formula, family = binomial(), data = parent.frame(),
   # self correlation, (1,2) and (1,2)
   self.factor=1
   # Compute column sums across rows of score matrix-like object for pairs with the same subject1/2
-  Usum1.tmp <- rowsum(U,IDs_subject1,reorder=FALSE)
-  Usum2.tmp <- rowsum(U,IDs_subject2,reorder=FALSE)
+  Usum1.tmp <- rowsum(U,IDs_subjectL,reorder=FALSE)
+  Usum2.tmp <- rowsum(U,IDs_subjectR,reorder=FALSE)
   Usum1  <- matrix(nrow = N, ncol = ncol(U),0)
   Usum2  <- matrix(nrow = N, ncol = ncol(U),0)
-  Usum1[unique(IDs_subject1),] <- Usum1.tmp
-  Usum2[unique(IDs_subject2),] <- Usum2.tmp
+  Usum1[unique(IDs_subjectL),] <- Usum1.tmp
+  Usum2[unique(IDs_subjectR),] <- Usum2.tmp
   UtUshared <- crossprod(Usum1) + crossprod(Usum2) 
   UtUswitched <- crossprod(Usum1,Usum2) + crossprod(Usum2,Usum1)
   UDiag<-crossprod(U) #Is counted twice as shared.factor, but needs to be counted as self.factor
@@ -267,14 +355,14 @@ lwo <- function (formula, family = binomial(), data = parent.frame(),
   out$offset <- offset
   
   if (is.null(out$offset)){
-    out$linear.predictors <- ans$X %*% ans$beta
+    out$linear.predictors <- ans$model.matrix %*% ans$beta
   } else {
-    out$linear.predictors <- out$offset + ans$X %*% ans$beta
+    out$linear.predictors <- out$offset + ans$model.matrix %*% ans$beta
   }
   
   out$fitted.values <- family(out)$linkinv(out$linear.predictors)
   out$modelInfo <- ans$model
-  out$id_pair <- ans$id_pair
+  out$id.pair <- ans$id.pair
   out$call <- ans$call
   out$corstr    <- ans$model$corstr
   out$cor.link  <- ans$model$cor.link
@@ -282,6 +370,7 @@ lwo <- function (formula, family = binomial(), data = parent.frame(),
   out$std.err   <- "san.se.modified"
   out$var <- varcov
   out$pair_table <- num_visits_per_pair
+  out$model.matrix <- ans$model.matrix
   class(out)    <- c("lwo","geeglm", "gee", "glm", "lm")
   
   return(out)
@@ -396,7 +485,6 @@ predict.lwo <- function (object, newdata = NULL, type = c("link", "response"),
     } 
   }
 }
-
 
 # Function to extract variable names from a formula
 extract_variable_names <- function(formula) {

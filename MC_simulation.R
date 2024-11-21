@@ -3,23 +3,29 @@ rm(list = ls())
 require(geepack)
 require(simstudy)
 require(GenOrd) # for generate ordinal samples
-require(calculus) # for derivative
+require(dplyr)
 source("functions.R")
 source("lwo.R")
 load("estimands_win_odds.RData")
 ################ simulation set up
 nsim <- 1e4
-N <- 100
-baseprobs <- rev(c(0.06,0.11,0.12,0.50,0.21))
+# for data generation
+# total sample size
+N <- 50
+# time point for each visit
 visits <- c(0,4,8) # baseline is visit = 0 
-# covariate effects estimated from SID trial
+#--- Derived from SID trial
+# baseline state occupancy probabilities
+baseprobs <- rev(c(0.06,0.11,0.12,0.50,0.21)) # reversed so larger outcomes are better
+# covariate effects 
 covs_effects_baseline <- c("trt"=0,"age"=-0.005,"pre_diarrhea"= 0.23)
+#--- Derived from SID trial
+# correlation structure and correlation coefficient 
 corstr <- "ar1"
-# working correlation 
-corstr_working <- "ar1"
 rho <- 0.6
 corMatrix <- generate_corMatrix(n_visits = length(visits),rho=rho,corstr = corstr)
-scenario <- "con"
+# simulation scenario, one of null, SID, pos and con
+scenario <- "pos"
 time_effect <- switch(scenario,
                       "null" = 0.15,
                       "SID" = 0.15,
@@ -38,54 +44,88 @@ time_trt_interaction <- switch(scenario,
                                "pos" = 0.1,
                                "con" = 0
 )
+true_wos <- switch (scenario,
+                    "null" = true_wos_null,
+                    "SID" = true_wos_SID,
+                    "pos" = true_wos_pos,
+                    "con" = true_wos_con
+)
+# for model fitting
 set.seed(86)
+# working correlation 
+corstr_working <- "ar1"
+# store the simulation results
+results <- vector(mode = "list",length = nsim)
 
 for(i in 1:nsim)
 {
-  # seed_list[[i]] <- .Random.seed
-  # for checking a specific repetition
-  # .Random.seed <- seed_list[[7]]
-  # generate the data (genordcat function can generate correlated ordinal outcomes)
+
   dat <- gen_data(N,baseprobs,covs_effects_baseline,
                   time_effect,trt_effect,time_trt_interaction,
                   visits,corMatrix)
   dat_wide <- dat$wide_format
   dat_long <- dat$long_format
-  # get data on the pair level
-  dat_pairs_long <- make_pseudo_pairs(data = dat_long,
-                                      ind_id = "id",
-                                      outcome_var = "GBS_DS",
-                                      trt_var = "trt",
-                                      time_var = "time",
-                                      pseudo_vars = c("age","pre_diarrhea"))
+  
+  # create indicator for week 4 and week 8
+  dat_long <- dat_long |>
+    mutate(w4 = 1*(time==4),w8 = 1*(time==8))
   # model time categorically
-  dat_pairs_long$week4_pseudo <- 1*(dat_pairs_long$time_pseudo == 4)
-  dat_pairs_long$week8_pseudo <- 1*(dat_pairs_long$time_pseudo == 8) 
-  mod_lwo <- lwo(GBS_DS_pseudo ~ 
-                # time_pseudo+
-                   week4_pseudo+week8_pseudo+
-                   age_pseudo+pre_diarrhea_pseudo,
-                 data=dat_pairs_long,
-                 group = trt_pseudo,
-                 id_pair = pair_ID,
-                 id1 = ID_subject1,
-                 id2 = ID_subject2,
-                 corstr = corstr_working)
- 
-  trans_matrix <- matrix(c(1,0,0,0,0,1,1,0,0,0,1,0,1,0,0),nrow = 3,byrow = T)
-  var_log_wos <- diag(trans_matrix%*%mod_lwo$var%*%t(trans_matrix))
+  # if scenario is constant treatment effect, then no interaction terms in the model
+  if(scenario == "con")
+  {
+    mod_lwo <- lwo(GBS_DS ~ trt + 
+                     # w4 + w8 + # cannot have main effect for time
+                     # trt:w4 + trt:w8+
+                     age + pre_diarrhea ,
+                   data = dat_long,
+                   id = "id",
+                   visit = "visit_cat",
+                 #  time.varname = c("w4","w8"),
+                   corstr = corstr_working)
+    
+    trans_matrix <- matrix(c(1,0,0,
+                             1,0,0,
+                             1,0,0),nrow = 3,byrow = T)
+    L <- matrix(c(1,0,0,
+                  1,0,0,
+                  1,0,0),nrow = 3,byrow = T)
+    p_val_global_null <- 2*pnorm(abs(mod_lwo$coefficients["trt"]/sqrt(mod_lwo$var["trt","trt"])),
+                               lower.tail = FALSE)
+  } else
+  {
+    mod_lwo <- lwo(GBS_DS ~ trt + 
+                     # w4 + w8 + # cannot have main effect for time
+                     trt:w4 + trt:w8+
+                     age + pre_diarrhea ,
+                   data = dat_long,
+                   id = "id",
+                   visit = "visit_cat",
+                   time.varname = c("w4","w8"),
+                   corstr = corstr_working)
+    
+    trans_matrix <- matrix(c(1,0,0,0,0,
+                             1,0,0,1,0,
+                             1,0,0,0,1),nrow = 3,byrow = T)
+    L <- matrix(c(1,0,0,0,0,
+                  0,0,0,1,0,
+                  0,0,0,0,1),nrow = 3,byrow = T)
+    # generalized Wald test for global null hypothesis
+    W_2 <- t(L%*%mod_lwo$coefficients)%*%solve(L%*%mod_lwo$var%*%t(L))%*%(L%*%mod_lwo$coefficients)
+    p_val_global_null <- pchisq(q=W_2,df=3,lower.tail = FALSE)
+  }
   est_log_wos <- trans_matrix%*%c(mod_lwo$coefficients)
+  var_log_wos <- diag(trans_matrix%*%mod_lwo$var%*%t(trans_matrix))
   # coverage on the log win odds scale
   CI_95 <- cbind(est_log_wos - qnorm(0.975)*sqrt(var_log_wos),est_log_wos + qnorm(0.975)*sqrt(var_log_wos))
   coverage_CI_95 <- log(true_wos) >= CI_95[,1] & log(true_wos) <= CI_95[,2]
-  # generalized Wald test for global null hypothesis
-  L <- matrix(c(1,0,0,0,0,0,1,0,0,0,0,0,1,0,0),nrow = 3,byrow = TRUE)
-  W_2 <- t(L%*%mod_lwo$coefficients)%*%solve(L%*%mod_lwo$var%*%t(L))%*%(L%*%mod_lwo$coefficients)
-  p_val_global_null <- pchisq(q=W_2,df=3,lower.tail = FALSE)
   results[[i]] <- list(est_log_wos,var_log_wos,CI_95,coverage_CI_95,p_val_global_null)
- if(i%%10==0)
+  if(i%%10==0)
    {print(i)
-   save(results,file=paste0("results/results-comp-N",N,"-rho",rho,"-",scenario,".RData"))
+  # save(results,file=paste0("results/results-comp-N",N,"-rho",rho,"-",scenario,".RData"))
  }
 }
 
+# # see bias
+# rowMeans(sapply(results, function(i) as.vector(i[[1]])-log(true_wos)))
+# # see coverage
+# rowMeans(sapply(results, function(i) i[[4]]))
