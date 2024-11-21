@@ -1,5 +1,6 @@
 # Longitudinal-win-odds
 R implementation for extension of probabilistic index model
+
 lwo.R: main functions for the longitudinal win odds implementation, contain the modeling fitting function lwo() and summary(), predict() functions 
 
 functions.R: some user defined functions for simulation
