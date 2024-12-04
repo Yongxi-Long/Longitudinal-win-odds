@@ -69,23 +69,27 @@ gen_data <- function(N,baseprobs,covs_effects_baseline,
 ##################################################
 # calculate_multinomial_probabilities
 ##################################################
-# function to calculate category probabilities based on provided category
-# probabilities and log odds ratios for each cut-point
-# shift_logit: a scalar/vector of log odds ratios for each cut-point
-# p0: reference category probabilities
-# common: Logical, default assumes proportionality, unless set to false and provide a vector of different log odds ratios
-calculate_multinomial_probabilities <- function(shift_logit,p0,common=TRUE) {
+#' function to calculate the new multinomial probabilities 
+#' lnORs: shifted log OR at each cut-point, if assume common OR then can supply
+#' a single log OR
+#' p0: the starting multinomial probabilities 
+#' common : whether assume common OR, if so the first element of input lnORs
+#' will be repeated for every cutpoint
+calculate_multinomial_probabilities <- function(lnORs,p0,common=TRUE) {
+  # number of ordinal categories
   k <- length(p0)
-  if(common==TRUE) {shift_logit <- rep(shift_logit[1],k)}
-  p1 <- numeric(k)
-  for (i in 1:(k-1)) {
-    logit_0 <- -qlogis(cumsum(p0)[i])
-    logit_1 <- logit_0 + shift_logit[i]
-    p1[i] <- plogis(-logit_1) - ifelse(i==1,0,sum(p1[1:(i-1)]))
-  }
-  p1[k] <- 1-sum(p1,na.rm = T)
+  if(common) lnORs = rep(lnORs[1],k-1)
+  # cumulative logit of p0
+  logit0 <- -qlogis(cumsum(p0))[-k]
+  # cumulative logit of p1 is shifted by supplied log ORs
+  logit1 <- logit0 + lnORs
+  # get cumulative probabilities for p1
+  cump1 <- plogis(-logit1)
+  # get multinomial probabilities for all categories
+  p1 <- c(cump1,1)-c(0,cump1)
   return(p1)
 }
+
 #############################################
 # function to calculate true win odds
 #############################################
