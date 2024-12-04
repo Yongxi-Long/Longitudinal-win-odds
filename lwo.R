@@ -23,6 +23,7 @@ lwo <- function (formula,
                   id,
                   visit,
                   time.varname = NULL,
+                  larger=TRUE,
                   corstr = "independence", 
                   weights,subset,na.action, start = NULL, etastart, mustart, 
                   offset, control = geese.control(...), method = "glm.fit", 
@@ -113,6 +114,11 @@ lwo <- function (formula,
     
     # convert pair level outcome to either a win (1), a tie (0.5) or a loss (0)
     dat.RminusL[,outcome.label] <- 0.5*(dat.RminusL[,outcome.label]==0) + 1*(dat.RminusL[,outcome.label] > 0)
+    # if smaller outcome means a win
+    if(larger == FALSE)
+    {
+      dat.RminusL[,outcome.label] <- 1 - dat.RminusL[,outcome.label]
+    }
     
     
     # We should not convert time variable to pair difference, because we only form pairs with subjects
@@ -438,19 +444,95 @@ print.summary.lwo <- function (x,
 #############################################
 # predict function for the lwo class object
 #############################################
-# object: model object of class lwo
-# newdata: new data frame with all predictors in the model formula
-# type: specify whether return estimated linear predictor (link) or probability (reponse)
-# conf.int: whether would like associated confidence interval
-# alpha: significance level for conf.int
+#' @param object: model object of class lwo
+#' @param newdata: new data frame with all predictors in the model formula
+#' @param id name of the column that contains cluster id. For example, patient id for repeated measurements on the same patient
+#' Data are assumed to be sorted so that observations on each cluster appear as contiguous rows in data. If data is not sorted this way,
+#'  the function will not identify the clusters correctly. 
+#' @param visit name of the column that contains visit within each cluster. We need this because subjects forming a pair must come from the same visit
+#' @param time.varname (scalar or vector of) variable names that represent time in the formula. This is IMPORTANT because
+#' time variable will not be converted into pair level. 
+#' @param type: specify whether return estimated linear predictor (link) or probability (reponse)
+#' @param conf.int: whether would like associated confidence interval
+#' @param alpha: significance level for conf.int
 #' @export
-predict.lwo <- function (object, newdata = NULL, type = c("link", "response"), 
+predict.lwo <- function (object, 
+                         newdata = NULL, 
+                         id,
+                         visit,
+                         time.varname=NULL,
+                         type = c("link", "response"), 
                          conf.int=FALSE, alpha=0.05,
                          na.action = na.pass, ...) 
 {
   type <- match.arg(type)
-  # form design matrix for the new data frame
-  mod_mat <- model.matrix(update(formula(object), NULL ~ .), data = newdata)
+  # form design matrix for the new data frame, from subject-level to pair-level
+  formula <- formula(object)
+  data <- newdata
+  relevant_vars <- extract_variable_names(formula)
+  outcome.label <- relevant_vars[1]
+  covariate.labels <-  relevant_vars[2:length(relevant_vars)]
+  
+  # only form pairs at the same visit, not from different visits
+  # list of all possible pairs
+  tab <- table(data[,id],data[,visit])
+  #table(mf[,"(id)"],mf[,"(visit)"]) # this records whether jth visit of ith subject is missing
+  all.possible.pairs <- data.frame(t(combn(as.numeric(rownames(tab)),2)))
+  colnames(all.possible.pairs) <- c("L","R")
+  meet <- apply(all.possible.pairs,1,function(i)
+  {
+    # add the appearance indicator of two individuals for all visits
+    # if no element is 2, then they never meet
+    meet <- any(tab[i["L"],] + tab[i["R"],]==2)
+    return(meet)
+  })
+  all.pairs <- all.possible.pairs[meet,]
+  all.pairs$pair.id <- 1:nrow(all.pairs)
+  
+  # now for each visit, make pseudo variable values on the pair level
+  # see how many visits are there
+  visits <- unique(data[,visit])[order(unique(data[,visit]))]
+  temp <- sapply(visits,function(i)
+  {
+    data.this.visit <- data[data[,visit]==i,]
+    # see which pairs can be formed at this visit
+    pairs.this.visit <- intersect(which(all.pairs$L %in% data.this.visit[,id]),
+                                  which(all.pairs$R %in% data.this.visit[,id]))
+    dat.pairs.this.visit <- all.pairs[pairs.this.visit,]
+    # get information from subject 1 
+    dat.L <- dplyr::left_join(dat.pairs.this.visit,
+                              dplyr::select(data.this.visit,all_of(c(id,covariate.labels))),
+                              by=c("L"=id))
+    # get information from subject 2
+    dat.R <- dplyr::left_join(dat.pairs.this.visit,
+                              dplyr::select(data.this.visit,all_of(c(id,covariate.labels))),
+                              by=c("R"=id))
+    # calculate pseudo variable values as the difference between subject 1 (left) and subject 2 (right): right - left always
+    dat.RminusL <- dat.R - dat.L 
+    dat.RminusL <- dplyr::select(dat.RminusL,-c("L","R","pair.id"))
+    
+    # We should not convert time variable to pair difference, because we only form pairs with subjects
+    # at the same time/visit, so pair level time variable is always zero
+    # use the mean value of time between left and right subject
+    dat.RminusL[,time.varname] <- (dat.L[,time.varname]+dat.R[,time.varname])/2
+    dat.comb <- cbind(dat.pairs.this.visit,dat.RminusL)
+    return(dat.comb)
+  },simplify=FALSE)
+  data.pair <- dplyr::bind_rows(temp)
+  data.pair <- data.pair[order(data.pair$pair.id),]
+  ##---- Modify model framework mf
+  # since we have converted data frame from individual level to pair level
+  # we have to modify the model framework accordingly
+  # make outcome just to be there such that model.frame() can work properly
+  data.pair[,outcome.label] <- rep(0,nrow(data.pair))
+  mf.pair <- model.frame(formula, data.pair, drop.unused.levels = TRUE)
+  mt.pair <- terms(mf.pair)
+  
+  ##---- Construct X and Y 
+  mod_mat <- model.matrix(mt.pair, mf.pair)
+  # remove intercept
+  mod_mat <- mod_mat[,colnames(mod_mat)!="(Intercept)"]
+  
   # get coefs
   coefs <- object$coefficients
   # get linear predictor
@@ -485,6 +567,7 @@ predict.lwo <- function (object, newdata = NULL, type = c("link", "response"),
     } 
   }
 }
+
 
 # Function to extract variable names from a formula
 extract_variable_names <- function(formula) {

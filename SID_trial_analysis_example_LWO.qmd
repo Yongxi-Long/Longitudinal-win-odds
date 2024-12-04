@@ -1,0 +1,463 @@
+---
+title: "Reanalyze SID trial by the LWO"
+author: "Yongxi Long"
+format: docx
+editor: visual
+---
+
+# Aim
+
+This script is to demonstrate how to fit a longitudinal probabilistic index model using the lwo() function and estimate win odds longitudinally.
+
+```{r}
+rm(list = ls())
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(ggsci)
+  library(splines) # for the natural cubic splines function
+  library(dplyr)
+  library(knitr)
+  library(simstudy)
+  library(plyr)
+  library(geepack)
+  library(ggpubr)
+  library(pim)
+  library(fastDummies)
+})
+# get user defined functions
+source("functions.r")
+# get the lwo function
+source("lwo.r")
+colors <- c("#AED0EE",
+            "#4d79a6",
+            "#489893",
+            "#A0BF52",
+            "#f1cd63",
+            "#F3993A",
+            "#C12C1F")
+```
+
+# Data
+
+## The paper used SID trial patient data
+
+```{r}
+load(file = "SID_long_cleaned.RData")
+load(file = "SID_wide_cleaned.RData")
+
+dat_wide <- SID
+dat_long <- SID_long
+
+# there were no category 0 (no symptom) patients and no category 6 (death) in 
+# before week 8, so combine category 0 with 1 and category 6 with 5 
+#dat_long$GBS_DS <- ifelse(dat_long$GBS_DS==0,1,dat_long$GBS_DS)
+#dat_long$GBS_DS <- ifelse(dat_long$GBS_DS==6,5,dat_long$GBS_DS)
+```
+
+
+```{r,warning=FALSE,eval=FALSE,echo=FALSE}
+#Data check
+# Fit a proportional odds model to make sure we have the same results as the published one
+library(rms)
+dd <- datadist(dat_wide)
+options(datadist=dd)
+# by default lrm modelling P(Y>=j)
+# to model a better outcome (lower GBSDS) we reverse the scale
+fit.po <- rms::lrm(rev(GBS_DS_week4) ~ treat_ITT,
+                   data = dat_wide)
+summary(fit.po)
+```
+
+## For demonstration we use a simulated data set
+
+We use the gen_data function to simulate ordinal repeated measurement. The data generation is designed upon te SID trial (Walgaard, C., Second intravenous immunoglobulin dose in patients with Guillain-Barré syndrome with poor prognosis (SID-GBS): a double-blind, randomised, placebo-controlled trial. The Lancet Neurology, 20(4), 275-283.)
+
+The simulated data set (wide/long format) has the following variables:
+
+-   Patient identifier: id
+-   Outcome: GBS-DS, a seven scale ordinal neuro-functionality score, but combined score 0 with 1 and score 6 with 5 due to small group sizes. Repeated measurements at all visits, no missing data
+-   Treatment assignment: trt, 1:1 equal randomization
+-   Covariate: age, continuous from a normal distribution with mean 60 and sd 10
+-   Covariate: pre_diarrhea: binary, yes(1)/no(0), prevalence is 40%
+
+## set simulation parameters
+
+```{r,eval=FALSE}
+# sample size (two arms)
+N <- 100
+# baseline category probabilities
+baseprobs <- c(0.02,0.06,0.11,0.12,0.47,0.21,0.01)
+# number of visits, unit is week
+visits <- c(0,1,2,4,8,12,26) # baseline is visit = 0 
+
+# simulate data from a proportional odds model
+# positive time trend towards higher score (self-healing)
+time_effect <- -0.05 
+# covariate effects estimated from SID trial
+covs_effects_baseline <- c("trt"=0,"age"=0.005,"pre_diarrhea"= -0.23)
+#treatment accelerates healing process
+time_trt_interaction <- -0.05
+
+# correlation structure, the simstady package generates correlated values from 
+# the logistic distribution using a standard normal copula-like approach 
+# with supplied correlation matrix
+rho <- 0.6 ; corstr <- "ar1"
+corMatrix <- generate_corMatrix(n_visits = length(visits),rho=rho,corstr = corstr)
+```
+
+## get the data
+
+```{r,eval=FALSE}
+set.seed(86)
+dat <- gen_data(N,baseprobs,covs_effects_baseline,
+                time_effect,time_trt_interaction,
+                visits,corMatrix)
+dat_wide <- dat$wide_format
+dat_long <- dat$long_format
+
+# change variable names to matche the SID trial data set
+colnames(dat_wide)[which(colnames(dat_wide)=="id")] <- "patient_ID"
+colnames(dat_wide)[which(colnames(dat_wide)=="trt")] <- "treat_ITT"
+colnames(dat_wide)[6:12] <- paste0("GBS_DS_week",c(0,1,2,4,8,12,26))
+# change GBS-DS range from 1-7 to 0-6 scale
+dat_wide[,paste0("GBS_DS_week",c(0,1,2,4,8,12,26))] <- dat_wide[,paste0("GBS_DS_week",c(0,1,2,4,8,12,26))] - 1
+
+colnames(dat_long)[which(colnames(dat_long)=="id")] <- "patient_ID"
+colnames(dat_long)[which(colnames(dat_long)=="trt")] <- "treat_ITT"
+colnames(dat_long)[which(colnames(dat_long)=="time")] <- "week"
+colnames(dat_long)[which(colnames(dat_long)=="y")] <- "GBS_DS"
+dat_long$GBS_DS <- dat_long$GBS_DS - 1
+```
+
+# Exploratory analysis
+
+## Proportion of categories over time
+
+```{r}
+# see the frequency distribution of ordinal categories over time
+tab <- as.data.frame.matrix(table("week"=dat_long$week,"GBS-DS"=dat_long$GBS_DS))
+colnames(tab) <- paste0("GBS-DS-", sort(unique(dat_long$GBS_DS)))
+rownames(tab) <- paste0("week",c(0,1,2,4,8,12,26))
+kable(tab)
+
+# visualize observed proportions of each category over time by treatment group
+cat_prop <- plyr::count(dat_long,c("treat_ITT","week","GBS_DS"))
+cat_prop$treat_ITT <- factor(cat_prop$treat_ITT,levels = c(0,1),
+                             labels = c("Control","Intervention"))
+ggplot(data = cat_prop,aes(x=factor(week),y=freq,fill=factor(GBS_DS)))+
+  facet_wrap(~treat_ITT)+
+  geom_bar(position = "fill",stat = "identity")+
+  labs(
+    #title = "Stacked Bar Chart of Observed Proportion of Each GBS-DS Score over Time",
+       x="Week",
+       y="Proportion",
+       fill="GBS-DS")+
+  theme_minimal()+
+  scale_fill_manual(values = colors)+
+  theme(
+    strip.text.x = element_text(size=12)
+  )
+```
+
+## empirical cumulative probability of each category
+
+```{r}
+# get empirical CDF for each category over time
+dat_long |>
+  mutate(GBS_DS = as.factor(GBS_DS),
+         treat = as.factor(treat_ITT)) |>
+  group_by(week,treat,GBS_DS) |>
+  dplyr::count() |>
+  group_by(week,treat) |>
+  dplyr::mutate(count=sum(n)) |>
+  dplyr::mutate(cumprob=n/count) |>
+  ggplot() +
+  aes(x = week, y = cumprob, color=GBS_DS, linetype=treat) +
+  geom_line(lwd=0.8) +
+  geom_point(alpha=0.6, size=0.5) +
+  scale_x_continuous(breaks = c(0,1,2,4,8,12,26)) +
+  scale_y_continuous(breaks = seq(0, 1, by=0.1)) +
+  coord_cartesian(ylim = c(0,0.8)) +
+  labs(x = "Study week",
+      # title = "Line Chart of Observed Proportion of Each GBS-DS Score over Time",
+       y = "Proportion",
+       color =  "GBS-DS",
+       linetype = "Treatment") +
+  scale_color_manual(values = colors)+
+  theme_minimal()+
+  scale_linetype_manual(values = c(1,2),
+                        labels=c("Intervention","Control"))
+  
+```
+
+## Individual horizontal line plot
+
+```{r}
+# order patients for better illustration
+ID_order0 <- dat_wide |>
+  filter(treat_ITT==0) |>
+ # arrange(visit1,visit2,visit3,visit4,visit5,visit6,visit7) |>
+  arrange(GBS_DS_week0,GBS_DS_week1,GBS_DS_week2,GBS_DS_week4,
+          GBS_DS_week8,GBS_DS_week12,GBS_DS_week26) |>
+  select(patient_ID) |>
+  unlist() |>
+  as.vector()
+ID_order1 <- dat_wide |>
+  filter(treat_ITT==1) |>
+ # arrange(visit1,visit2,visit3,visit4,visit5,visit6,visit7) |>
+  arrange(GBS_DS_week0,GBS_DS_week1,GBS_DS_week2,GBS_DS_week4,
+          GBS_DS_week8,GBS_DS_week12,GBS_DS_week26) |>
+  select(patient_ID) |>
+  unlist() |>
+  as.vector()
+dat_long_ordered <- bind_rows(sapply(c(ID_order0,ID_order1), function(id) {
+  df <- dat_long[which(dat_long$patient_ID==id),]
+  if(id %in% ID_order0)
+  {
+    df$order <- rep(which(ID_order0==id),nrow(df))
+  } else
+  {
+    df$order <- rep(which(ID_order1==id),nrow(df))
+  }
+  return(df)
+},simplify = FALSE))
+
+dat_long_ordered <- dat_long_ordered |>
+  mutate(id = as.factor(order),treat_ITT=factor(treat_ITT,
+                                                levels=c(0,1),
+                                                labels=c("Control","Intervention"))) 
+                                               
+
+p0 <- ggplot(subset(dat_long_ordered,treat_ITT=="Control")) +
+  #facet_grid(rows = vars(treat_ITT),switch = "y")+
+  aes(y=id, x=factor(week)) +
+  geom_tile(mapping = aes(fill = as.factor(GBS_DS)),
+            width=0.95, height=1) +
+  scale_fill_manual(values = colors) +
+  #scale_x_discrete(limits=as.character(c(0,1,2,4,8,12,26))) +
+  expand_limits(fill = c(as.character(0:6))) +
+  labs(x = "Study week",
+       y = "One patient per line",
+       fill = "GBS-DS",
+       title = "Control")+
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+     plot.title = element_text(size=12)
+  )
+p1 <- ggplot(subset(dat_long_ordered,treat_ITT=="Intervention")) +
+  #facet_grid(rows = vars(treat_ITT),switch = "y")+
+  aes(y=id, x=factor(week)) +
+  geom_tile(mapping = aes(fill = as.factor(GBS_DS)),
+            width=0.95, height=1) +
+  scale_fill_manual(values = colors) +
+  #scale_x_discrete(limits=as.character(c(0,1,2,4,8,12,26))) +
+  expand_limits(fill = c(as.character(0:6))) +
+  labs( x="",
+      y = "One patient per line",
+       fill = "GBS-DS",
+      title = "Intervention")+
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    plot.title = element_text(size=12)
+  )
+
+ggarrange(p1,p0,ncol=1,nrow=2,common.legend = TRUE,
+          legend = "right")
+
+```
+
+# Longitudinal win odds analysis
+
+-   Assume successful randomization, we don't model treatment effect at baseline. We adjust for baseline GBS-DS
+
+-   The function internally convert individual-level data to pair-level data
+
+## Analysis 1: model treatment effect change through spline
+
+-   From exploratory data analysis, we see a curved shape of individual patient trajectories over time, and also we see the distribution of the GBS-DS kind of shifted up first (week 0 to week 2) and then went down. So we model the treatment effect trajectory in the natural cubic spline form with one knot at week 2 (degree of freedom = 2, allows the curve to "bend" once).
+
+```{r}
+dat_long$GBS_DS_baseline <- rep(dat_wide$GBS_DS_week0,as.vector(table(dat_long$patient_ID)))
+# delete baseline as an outcome
+dat_long <- dat_long[dat_long$week>0,]
+# model time as a natural cubic spline with 3 knots
+# use auto regressive of order 1 as the working correlation structure
+# for the temporal correlation
+mod.lwo <- lwo(
+  GBS_DS ~ treat_ITT + age + pre_diarrhea + GBS_DS_baseline+
+    treat_ITT:ns(week,knots = 2),
+  data = dat_long,
+  id = "patient_ID",
+  visit = "time",
+  time.varname = "week",
+  corstr = "ar1",
+  larger = FALSE
+)
+```
+
+```{r}
+summary(mod.lwo)
+```
+
+-   To get win odds for a sequence of time points (week 1 till week 26), construct a new dataframe and use the predict() function.
+
+```{r}
+# we want to get win odds from week 1 till week 26, conditional on that
+# the pairs have the same age and same preceding diarrhea status and same baseline GBS-DS
+# so set age and pre_diarrhea and GBS_DS_baseline to 0
+nvisits <- 26
+newdata <- data.frame(
+  id = rep(c(1,2),each=nvisits),
+  week = rep(1:nvisits,2),
+  treat_ITT = rep(c(0,1),each=nvisits),
+  age = rep(60,nvisits*2),
+  pre_diarrhea = rep(0,2*nvisits),
+  GBS_DS_baseline = rep(4,2*nvisits)
+)
+pred.lp <- predict(mod.lwo,newdata,
+                   id="id",
+                   visit="week",
+                    time.varname = "week",
+                   type="link",conf.int = TRUE)
+pred.wo <- exp(pred.lp)
+```
+
+-   For comparison, we calculate the win odds at all visits of GBS-DS (primary endpoint) from single-time probabilistic index model
+
+```{r,warning=FALSE}
+# adjusted win odds for week 1,2,4,8,12,26
+covs <- paste0("GBS_DS_week",c(1,2,4,8,12,26))
+wo.adj <- sapply(covs, function(cov)
+  {
+  data <- dat_wide[!is.na(dat_wide[,cov]),]
+  # by default PIM thinks larger outcome is a win,
+  # to accomodate that smaller GBS-DS is better
+  # we reverse the outcome
+  data[,cov] <- 6 - data[,cov]
+  formula <- as.formula(paste0(cov,"~treat_ITT+age+pre_diarrhea+GBS_DS_week0"))
+  mod.adj <- pim(formula = formula,data = data)
+  wo.adj <- c(exp(mod.adj@coef["treat_ITT"]),exp(confint(mod.adj)["treat_ITT",]))
+  names(wo.adj) <- c("estimate","lower.CI","upper.CI")
+  return(wo.adj)
+}) |>
+  t() |>
+  as.data.frame()
+```
+
+-   Visualize estimated win odds for each week, add single-time point win odds analysis for comparison.
+
+```{r,echo=FALSE}
+# odds scale
+wo_df <- data.frame(cbind(week=1:26,pred.wo))
+ggplot(wo_df,aes(x=week,y=estimate))+
+  geom_line()+
+  geom_point()+
+  theme_minimal()+
+  scale_x_continuous(breaks = 1:26)+
+  geom_hline(yintercept = 1,color="#B14E53",linetype=2)+
+  geom_errorbar(aes(ymin=lower.CI,ymax=upper.CI),width=.3,color="#4d79a6")+
+  annotate("ribbon",x=c(0.9,1.1),ymin = wo.adj["GBS_DS_week1","lower.CI"],ymax = wo.adj["GBS_DS_week1","upper.CI"],
+           alpha=0.4,fill="#489893")+
+  annotate("point",x=1,y=wo.adj["GBS_DS_week1","estimate"],
+           color="#489893",shape=15,size=2.5)+
+  annotate("ribbon",x=c(1.9,2.1),ymin = wo.adj["GBS_DS_week2","lower.CI"],ymax = wo.adj["GBS_DS_week2","upper.CI"],
+           alpha=0.4,fill="#489893")+
+  annotate("point",x=2,y=wo.adj["GBS_DS_week2","estimate"],
+           color="#489893",shape=15,size=2.5)+
+  annotate("ribbon",x=c(3.9,4.1),ymin = wo.adj["GBS_DS_week4","lower.CI"],ymax = wo.adj["GBS_DS_week4","upper.CI"],
+           alpha=0.4,fill="#489893")+
+  annotate("point",x=4,y=wo.adj["GBS_DS_week4","estimate"],
+           color="#489893",shape=15,size=2.5)+
+  annotate("ribbon",x=c(7.9,8.1),ymin = wo.adj["GBS_DS_week8","lower.CI"],ymax = wo.adj["GBS_DS_week8","upper.CI"],
+           alpha=0.4,fill="#489893")+
+  annotate("point",x=8,y=wo.adj["GBS_DS_week8","estimate"],
+           color="#489893",shape=15,size=2.5)+
+  annotate("ribbon",x=c(11.9,12.1),ymin = wo.adj["GBS_DS_week12","lower.CI"],ymax = wo.adj["GBS_DS_week12","upper.CI"],
+           alpha=0.4,fill="#489893")+
+  annotate("point",x=12,y=wo.adj["GBS_DS_week12","estimate"],
+           color="#489893",shape=15,size=2.5)+
+  annotate("ribbon",x=c(25.9,26.1),ymin = wo.adj["GBS_DS_week26","lower.CI"],ymax = wo.adj["GBS_DS_week26","upper.CI"],
+           alpha=0.4,fill="#489893")+
+  annotate("point",x=26,y=wo.adj["GBS_DS_week26","estimate"],
+           color="#489893",shape=15,size=2.5)+
+  labs(x="Week",y="Estimate win odds")
+
+```
+
+## Analysis 2: Response profile modelling (time as a categorical covariate)
+
+-   In this analysis, we use an unstructured model for the probabilistic index. Namely, we don't assume a parametric form for the treatment effect trajectory, instead, we model time categorically.
+
+```{r}
+# model time categorically
+dat_long2 <- dummy_cols(dat_long,
+                  select_columns = "week",
+                  remove_first_dummy = TRUE)
+mod.lwo <- lwo(
+  GBS_DS ~ treat_ITT + age + pre_diarrhea + GBS_DS_baseline+
+    treat_ITT:week_2+
+    treat_ITT:week_4+
+    treat_ITT:week_8+
+    treat_ITT:week_12+
+    treat_ITT:week_26,
+  data = dat_long2,
+  id = "patient_ID",
+  visit = "time",
+  time.varname = paste0("week_",c(2,4,8,12,26)),
+  corstr = "ar1",
+  larger = FALSE
+)
+```
+```{r}
+newdata <- dat_long2[dat_long2$patient_ID==1,]
+nvisits <- nrow(newdata)
+newdata <- rbind(newdata,newdata)
+newdata$patient_ID[(nvisits+1):(2*nvisits)] <- 2
+newdata$treat_ITT <- rep(c(0,1),each=nvisits)
+pred.lp <- predict(mod.lwo,newdata,
+                   id="patient_ID",
+                   visit="time",
+                    time.varname = paste0("week_",c(2,4,8,12,26)),
+                   type="link",conf.int = TRUE)
+pred.wo <- exp(pred.lp)
+```
+
+```{r,echo=FALSE}
+wo_df <- data.frame(cbind(week=c(1,2,4,8,12,26),pred.wo))
+ggplot(wo_df,aes(x=week,y=estimate))+
+  geom_line()+
+  geom_point()+
+  theme_minimal()+
+  scale_x_continuous(breaks = 1:26)+
+  geom_hline(yintercept = 1,color="#B14E53",linetype=2)+
+  geom_errorbar(aes(ymin=lower.CI,ymax=upper.CI),width=.3,color="#4d79a6")+
+  annotate("ribbon",x=c(0.9,1.1),ymin = wo.adj["GBS_DS_week1","lower.CI"],ymax = wo.adj["GBS_DS_week1","upper.CI"],
+           alpha=0.4,fill="#489893")+
+  annotate("point",x=1,y=wo.adj["GBS_DS_week1","estimate"],
+           color="#489893",shape=15,size=2.5)+
+  annotate("ribbon",x=c(1.9,2.1),ymin = wo.adj["GBS_DS_week2","lower.CI"],ymax = wo.adj["GBS_DS_week2","upper.CI"],
+           alpha=0.4,fill="#489893")+
+  annotate("point",x=2,y=wo.adj["GBS_DS_week2","estimate"],
+           color="#489893",shape=15,size=2.5)+
+  annotate("ribbon",x=c(3.9,4.1),ymin = wo.adj["GBS_DS_week4","lower.CI"],ymax = wo.adj["GBS_DS_week4","upper.CI"],
+           alpha=0.4,fill="#489893")+
+  annotate("point",x=4,y=wo.adj["GBS_DS_week4","estimate"],
+           color="#489893",shape=15,size=2.5)+
+  annotate("ribbon",x=c(7.9,8.1),ymin = wo.adj["GBS_DS_week8","lower.CI"],ymax = wo.adj["GBS_DS_week8","upper.CI"],
+           alpha=0.4,fill="#489893")+
+  annotate("point",x=8,y=wo.adj["GBS_DS_week8","estimate"],
+           color="#489893",shape=15,size=2.5)+
+  annotate("ribbon",x=c(11.9,12.1),ymin = wo.adj["GBS_DS_week12","lower.CI"],ymax = wo.adj["GBS_DS_week12","upper.CI"],
+           alpha=0.4,fill="#489893")+
+  annotate("point",x=12,y=wo.adj["GBS_DS_week12","estimate"],
+           color="#489893",shape=15,size=2.5)+
+  annotate("ribbon",x=c(25.9,26.1),ymin = wo.adj["GBS_DS_week26","lower.CI"],ymax = wo.adj["GBS_DS_week26","upper.CI"],
+           alpha=0.4,fill="#489893")+
+  annotate("point",x=26,y=wo.adj["GBS_DS_week26","estimate"],
+           color="#489893",shape=15,size=2.5)+
+  labs(x="Week",y="Estimate win odds")
+
+```
+
