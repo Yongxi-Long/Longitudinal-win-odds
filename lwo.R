@@ -1,4 +1,3 @@
-
 #' @title longitudinal win odds
 #' @description
 #' function for fitting a longitudinal probabilistic index model with logit link
@@ -9,28 +8,37 @@
 #' @param id name of the column that contains cluster id. For example, patient id for repeated measurements on the same patient
 #' Data are assumed to be sorted so that observations on each cluster appear as contiguous rows in data. If data is not sorted this way,
 #'  the function will not identify the clusters correctly. 
-#' @param visit name of the column that contains visit within each cluster. We need this because subjects forming a pair must come from the same visit
-#' @param time.varname (scalar or vector of) variable names that represent time in the formula. This is IMPORTANT because
+#' @param visit name of the column that contains visit within each cluster. 
+#' We need this because subjects forming a pair must come from the same visit
+#' @param time.varname Optional, needed if time-varying effets are modeled. 
+#' It should be a scalar or vector of variable names that represent time in the formula. This is IMPORTANT because
 #' time variable will not be converted into pair level. 
 #' @param corstr working correlation structure, one of "independence"', '"exchangeable"', '"ar1"', '"unstructured"' and '"userdefined"'
 #' @param zcor Used for entering a user defined working correlation structure.
+#' @param larger: whether larger values of the ordinal category means better outcome conditions (a win). 
+#' Default is TRUE. 
 #' @param weights weight for each observation
 #' @import geepack
 #' @export lwo
-lwo <- function (formula, 
-                  data = parent.frame(), 
-                  family = binomial(),
-                  id,
-                  visit,
-                  time.varname = NULL,
-                  larger=TRUE,
-                  corstr = "independence", 
-                  weights,subset,na.action, start = NULL, etastart, mustart, 
-                  offset, control = geese.control(...), method = "glm.fit", 
-                  contrasts = NULL, waves = NULL, 
-                  zcor = NULL, scale.fix = TRUE, 
-                  scale.value = 1,std.err="san.se", ...) 
+require(geepack)
+lwo <- function(
+    formula, 
+    data = parent.frame(), 
+    family = binomial(),
+    id,
+    visit,
+    time.varname = NULL,
+    larger=TRUE,
+    corstr = "independence", 
+    weights,subset,na.action, start = NULL, etastart, mustart, 
+    offset, control = geese.control(...), method = "glm.fit", 
+    contrasts = NULL, waves = NULL, 
+    zcor = NULL, scale.fix = TRUE, 
+    scale.value = 1,std.err="san.se", ...) 
 {
+  if (!requireNamespace("geepack", quietly = TRUE)) {
+    stop("Package 'geepack' is required but not installed.")
+  }
   if (missing(data)) 
     data <- environment(formula) #If data is not explicitly provided, R uses the environment in which the formula was created to find the variables (e.g., the global environment or a specific data frame).
   ##---- Prepare model matrix and response vector
@@ -66,9 +74,9 @@ lwo <- function (formula,
   mt <- attr(mf, "terms")
   # return(list(mf,mt))
   
-  ################################################################################
-  # Create new data frame from input dataframe: convert outcome and covariate to pair level        
-  ################################################################################
+  # ###############################################################################
+  # Create new data frame from input dataframe: convert outcome and covariate to pair level
+  # ###############################################################################
   # we need input id name and time name, because time variable will not be converted to pair level
   relevant_vars <- extract_variable_names(formula)
   outcome.label <- relevant_vars[1]
@@ -84,7 +92,8 @@ lwo <- function (formula,
   {
     # add the appearance indicator of two individuals for all visits
     # if no element is 2, then they never meet
-    meet <- any(tab[i["L"],] + tab[i["R"],]==2)
+    meet <- any(tab[rownames(tab)==as.character(i["L"]),] 
+                + tab[rownames(tab)==as.character(i["R"]),]==2)
     return(meet)
   })
   all.pairs <- all.possible.pairs[meet,]
@@ -100,7 +109,7 @@ lwo <- function (formula,
     pairs.this.visit <- intersect(which(all.pairs$L %in% data.this.visit[,id]),
                                   which(all.pairs$R %in% data.this.visit[,id]))
     dat.pairs.this.visit <- all.pairs[pairs.this.visit,]
-    # get information from subject 1 
+    # get information from subject 1
     dat.L <- dplyr::left_join(dat.pairs.this.visit,
                               dplyr::select(data.this.visit,all_of(c(id,relevant_vars))),
                               by=c("L"=id))
@@ -109,7 +118,7 @@ lwo <- function (formula,
                               dplyr::select(data.this.visit,all_of(c(id,relevant_vars))),
                               by=c("R"=id))
     # calculate pseudo variable values as the difference between subject 1 (left) and subject 2 (right): right - left always
-    dat.RminusL <- dat.R - dat.L 
+    dat.RminusL <- dat.R - dat.L
     dat.RminusL <- dplyr::select(dat.RminusL,-c("L","R","pair.id"))
     
     # convert pair level outcome to either a win (1), a tie (0.5) or a loss (0)
@@ -135,26 +144,26 @@ lwo <- function (formula,
   # we have to modify the model framework accordingly
   mf.pair <- model.frame(formula, data.pair, drop.unused.levels = TRUE)
   mt.pair <- terms(mf.pair)
-  
-  ##---- Construct X and Y 
+  # return(list(data.pair,formula))
+  ##---- Construct X and Y
   Y  <- model.response(mf.pair, "numeric")
   N <- NROW(Y) # number of pairs
-  X  <- if (!is.empty.model(mt.pair)) 
+  X  <- if (!is.empty.model(mt.pair))
   {
     model.matrix(mt.pair, mf.pair, contrasts)
-  }else 
+  }else
   {matrix(, N, 0)}
   # remove intercept
-  X <- X[,colnames(X)!="(Intercept)"]
+  X <- X[,colnames(X)!="(Intercept)",drop=FALSE]
   
   ##---- Clustering variable
   id.pair <- data.pair[,"pair.id"]
   if (is.null(id.pair)) stop("pair id variable not found.")
   
   ##---- Get family, for longitudinal win odds, only logit link is valid
-  if (is.character(family)) 
+  if (is.character(family))
     family <- get(family, mode = "function", envir = parent.frame())
-  if (is.function(family)) 
+  if (is.function(family))
     family <- family()
   if (is.null(family$family)) {
     print(family)
@@ -166,18 +175,18 @@ lwo <- function (formula,
   }
   
   ##---- Match method, can only return model data frame if user inputs "model.frame"
-  if (identical(method, "model.frame")) 
+  if (identical(method, "model.frame"))
     return(mf.pair)
-  if (!is.character(method) && !is.function(method)) 
+  if (!is.character(method) && !is.function(method))
     stop("invalid 'method' argument")
-  if (identical(method, "glm.fit")) 
+  if (identical(method, "glm.fit"))
     control <- do.call("geese.control", control)
   
   ##---- Working correlation structures
   if (corstr=="fixed" && is.null(zcor)){
     stop("When corstr is 'fixed' then 'zcor' must be given\n")
   }
-  CORSTRS <- c("independence", "exchangeable", "ar1", "unstructured", 
+  CORSTRS <- c("independence", "exchangeable", "ar1", "unstructured",
                "userdefined", "fixed")
   # do partial match if users put ind instead of independence
   corstrv <- pmatch(corstr, CORSTRS, -1)
@@ -196,7 +205,7 @@ lwo <- function (formula,
   if (is.null(offset)) offset <- rep(0, N)
   soffset <- rep(0, N)
   
-  ## Check that factors in model do not have unused levels in data 
+  ## Check that factors in model do not have unused levels in data
   ## (otherwise R crashes).
   vars <- all.vars(formula)
   stopIt <- FALSE
@@ -205,7 +214,7 @@ lwo <- function (formula,
     if(!is.na(match(vv, names(mf))) && is.factor(mf[,vv])){
       if (length(unique(mf[,vv])) != length(levels(mf[,vv]))){
         cat("Factors not allowed to have unused levels...\n")
-        cat(" Levels of factor", vv,":", paste(levels(mf[, vv]), sep=' '),"\n")  
+        cat(" Levels of factor", vv,":", paste(levels(mf[, vv]), sep=' '),"\n")
         cat(" Used levels of factor", vv,":", paste(unique(mf[, vv]), sep=' '),"\n")
         stopIt <- TRUE
       }
@@ -216,9 +225,9 @@ lwo <- function (formula,
   
   
   ##---- Create dummy glm object in order for the model to fit in generic functions that have glm method
-  glmFit <- glm.fit(x = X, y = Y, weights = rep(1,N), start = NULL, etastart = NULL, 
-                    mustart = NULL, offset = rep(0,N), family = binomial(), 
-                    control = list(), intercept = TRUE, singular.ok = TRUE)
+  glmFit <- suppressWarnings(glm.fit(x = X, y = Y, weights = rep(1,N), start = NULL, etastart = NULL,
+                                     mustart = NULL, offset = rep(0,N), family = binomial(),
+                                     control = list(), intercept = TRUE, singular.ok = TRUE))
   class(glmFit) <- "glm"
   glmFit$terms <- mt.pair
   glmFit$model <- mf.pair
@@ -229,17 +238,17 @@ lwo <- function (formula,
   #   stop("Model matrix is rank deficient; geeglm can not proceed\n")
   # }
   
-  ##---- Use geese.fit to estimate parameters, the variances are wrong which will be 
+  ##---- Use geese.fit to estimate parameters, the variances are wrong which will be
   # fixed later
-  ans <- geese.fit(x=X, y=Y, id=id.pair, 
-                   family=family,
-                   corstr=corstr,zcor = zcor,
-                   offset=offset, soffset=soffset,
-                   weights=weights, waves = waves, control = control, 
-                   corp = NULL, b = NULL, 
-                   alpha = NULL, gm = NULL,  mean.link = NULL, variance = NULL, 
-                   cor.link = "identity", sca.link = "identity", link.same = TRUE, 
-                   scale.fix = scale.fix, scale.value = 1)
+  ans <- suppressWarnings(geepack::geese.fit(x=X, y=Y, id=id.pair,
+                                             family=family,
+                                             corstr=corstr,zcor = zcor,
+                                             offset=offset, soffset=soffset,
+                                             weights=weights, waves = waves, control = control,
+                                             corp = NULL, b = NULL,
+                                             alpha = NULL, gm = NULL,  mean.link = NULL, variance = NULL,
+                                             cor.link = "identity", sca.link = "identity", link.same = TRUE,
+                                             scale.fix = scale.fix, scale.value = 1))
   ans <- c(ans, list(call = call, formula = formula))
   class(ans)  <- "geese"
   ans$model.matrix <- X
@@ -266,7 +275,7 @@ lwo <- function (formula,
   U_l <- x*c(mu*(1-mu))
   # U_l <- diag(mu*(1-mu))%*%x # this is also valid but super slow
   cum_num_visits_per_pair <- c(0,cumsum(num_visits_per_pair))
-  U <- t(sapply(1:N_pairs, function(i) 
+  U <- t(sapply(1:N_pairs, function(i)
   {
     row_indexes <- (cum_num_visits_per_pair[i]+1):cum_num_visits_per_pair[i+1]
     R_inv <- R_inv_list[[length(row_indexes)]]
@@ -281,7 +290,7 @@ lwo <- function (formula,
   
   ########## sandwich estimator
   # the bread part which takes care of variance
-  # analytically, faster than numerical 
+  # analytically, faster than numerical
   U.diff <- sapply(1:N_pairs, function(i)
   {
     row_indexes <- (cum_num_visits_per_pair[i]+1):cum_num_visits_per_pair[i+1]
@@ -336,10 +345,10 @@ lwo <- function (formula,
   Usum2  <- matrix(nrow = N, ncol = ncol(U),0)
   Usum1[unique(IDs_subjectL),] <- Usum1.tmp
   Usum2[unique(IDs_subjectR),] <- Usum2.tmp
-  UtUshared <- crossprod(Usum1) + crossprod(Usum2) 
+  UtUshared <- crossprod(Usum1) + crossprod(Usum2)
   UtUswitched <- crossprod(Usum1,Usum2) + crossprod(Usum2,Usum1)
   UDiag<-crossprod(U) #Is counted twice as shared.factor, but needs to be counted as self.factor
-  UtU<-shared.factor*UtUshared  + 
+  UtU<-shared.factor*UtUshared  +
     (switched.factor)*UtUswitched +
     (self.factor-2*shared.factor)*(UDiag)
   
@@ -351,7 +360,7 @@ lwo <- function (formula,
   
   ##---- Prepare output
   out <- glmFit # build on the skeleton of glm
-  toDelete    <- c("R", "deviance", "aic", "null.deviance", "iter", 
+  toDelete    <- c("R", "deviance", "aic", "null.deviance", "iter",
                    "df.null", "converged", "boundary")
   out[match(toDelete,names(out))] <- NULL
   out$method <- "geese.fit"
@@ -483,7 +492,8 @@ predict.lwo <- function (object,
   {
     # add the appearance indicator of two individuals for all visits
     # if no element is 2, then they never meet
-    meet <- any(tab[i["L"],] + tab[i["R"],]==2)
+    meet <- any(tab[rownames(tab)==as.character(i["L"]),] 
+                + tab[rownames(tab)==as.character(i["R"]),]==2)
     return(meet)
   })
   all.pairs <- all.possible.pairs[meet,]
