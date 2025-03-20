@@ -1,0 +1,210 @@
+---
+title: "Longitudinal extension of the win odds for ordinal repeated measurements"
+author: "Y. Long"
+toc: TRUE
+date: "2024-01-19"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+
+# Aim
+
+The script sets up the simulation scenarios and evaluates the simulation results.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE,warning=FALSE}
+rm(list=ls())
+library(dplyr)
+library(ggplot2)
+library(latex2exp)
+source("functions.r") # self-defined functions
+```
+
+# 1. Simulation parameters setup
+
+## global parameters (fixed through-out)
+
+```{r}
+# the base probabilities at time 0, resemble SID-GBS trial
+# GBS 01 combined, 56 combined
+# reversed such that higher score means better condition
+baseprobs <- rev(c(0.06,0.11,0.12,0.50,0.21))
+# consider baseline, week 4 and week 8
+visits <- c(0,4,8) # baseline is visit = 0 
+# number of iterations for each simulation scenario
+nsim <- 1e4
+```
+
+
+## Estimands at each visit by construction
+
+ + PIM gives marginal effect (conditional on the difference of the covariate value between two subjects being zero instead of the absolute value of the covariate being zero).
+  
+ + The PIM adjusted for age $X_1$ and preceding diarrhea $X_2$ is \ 
+ 
+ $P(Y_j^{(t)} \succcurlyeq Y_i^{(t)}|A_j=1,A_i=0,\mathbf{X_j},\mathbf{X_i})=g^{-1}\Bigl(\beta_0+\beta_1 visit_1+\beta_2visit_2 +\gamma_1 (X_{1j}-X_{1i})+\gamma_2 (X_{2j}-X_{2i})\Bigr)$
+  
+  + $\beta_0, \beta_0+\beta_1,\beta_0+\beta_2$ is the adjusted log win odds at baseline, visit 1, and visit 2 respectively.
+  
+  + It is not conditional on age being zero and preceding diarrhea being at the reference category, but on being of the same age and preceding diarrhea group. Still have to average over age & preceding diarrhea strata, like a marginal effect.
+  
+  + To compute the true marginal win odds, generate a large data set and use stratification and weighting to approximate marginal win odds, the larger the N_approx, the more precise. 
+  
+```{r,eval=FALSE}
+set.seed(86)
+N_approx <- 1e6
+# covariate effects estimated from SID trial
+covs_effects_baseline <- c("age"=-0.005,"pre_diarrhea"= 0.23)
+# this is estimated from SID trial (after week 1)
+# We evaluate three scenarios: null, SID trial, positive SID trial, constant TE
+scenario <- "con"
+time_effect <- switch(scenario,
+  "null" = 0.15,
+  "SID" = 0.15,
+  "pos" = 0.15,
+  "con" = 0
+) # beta1, positive time trend towards higher score (self-healing)
+trt_effect <- switch(scenario,
+  "null" = 0,
+  "SID" = 0,
+  "pos" = 0,
+  "con" = 1
+)
+time_trt_interaction <- switch(scenario,
+  "null" = 0,
+  "SID" = -0.02,# -0.02 comes from SID trial (after week 1) which is very neutral
+  "pos" = 0.1,
+  "con" = 0
+)
+true_wos_con <- calculate_adjusted_win_odds_multiple_visits(N_approx,
+                                                            baseprobs,
+                                                            covs_effects_baseline,
+                                                            time_effect,
+                                                            trt_effect,
+                                                            time_trt_interaction,
+                                                            visits)
+```
+  
+
+
+# 2. Results assessment
+
+* Wald test for the global null hypothesis:
+
+$$H_0: \beta_0=\beta_1=\beta_2=0$$
+
+```{r}
+sce_para <- expand.grid(N=c(50,100,200),rho=c(0.3,0.6),scenario=1:4)
+sce_para$hypothesis <- rep(c("null","SID","pos","con"),each=6)
+```
+
+## plot of spread of estimates (log win odds)
+
+```{r}
+bias_list <- apply(sce_para, 1, function(x)
+{
+  type = "comp";N=as.numeric(x["N"]);rho=as.numeric(x["rho"]);hypothesis = x["hypothesis"]
+  load(paste0("results/results-",type,"-N",N,"-rho",rho,"-",hypothesis,".RData"))
+  load("estimands_win_odds.RData")
+   if(hypothesis=="null")
+  {
+    true_wos <- true_wos_null
+  } else if (hypothesis=="SID")
+  {
+    true_wos <- true_wos_SID
+  } else if (hypothesis=="pos")
+  {
+    true_wos <- true_wos_pos
+  } else if (hypothesis == "con")
+  {
+    true_wos <- true_wos_con
+  }
+  est_log_wos <- data.frame(t(sapply(results, function(i) return(i[[1]]-log(true_wos)))))
+  colnames(est_log_wos) <- paste0("week",c(0,4,8))
+  out <-  reshape2::melt(est_log_wos,measure.vars=paste0("week",c(0,4,8)),
+                         value.name = "bias",variable.name="visit")
+  out$sample_size <- N
+  out$rho <- rho
+  out$scenario <- x["scenario"]
+  return(out)
+})
+bias_df <- dplyr::bind_rows(bias_list)
+
+bias_df |>
+  group_by(scenario,sample_size,rho,visit) |>
+  summarise(bias = mean(bias))
+```
+
+
+```{r}
+bias_df$rho_f <- factor(bias_df$rho,
+                             levels=c(0.3,0.6),
+                             labels=c(TeX("$\\rho$ = 0.3"),TeX("$\\rho$ = 0.6")))
+bias_df$scenario <- factor(bias_df$scenario,levels = 1:4,
+                            labels = c("Null","SID","Increasing","Constant"))
+# bias_df$scenario <- dplyr::case_when(
+#   bias_df$scenario == "null" ~"Null",
+#   bias_df$scenario == "pos" ~"Increasing",
+#   bias_df$scenario == "con" ~"Constant",
+#   bias_df$scenario == "SID" ~ "SID"
+# )
+ggplot(bias_df,aes(x=visit,y=bias,color=factor(sample_size)))+
+  facet_grid(rho_f~scenario,labeller = label_parsed)+
+  geom_boxplot(outlier.shape = NA)+
+  labs(color="Sample size"
+       #,title = "Monte Carlo standard error = 0.002 (10,000 simulations)"
+       )+
+  theme_bw()+
+  ylim(c(-0.8,0.8))+
+  geom_hline(yintercept = 0,linetype=2,color="coral")+
+  labs(x="Visit (week)",y="Estimates (log win odds) - Estimand")+
+  scale_color_manual(values = c("#B395BD","#7DAEE0","#EA8379"))+
+ # scale_x_continuous(breaks = c(0,4,8))+
+  theme(
+    legend.position = "bottom"
+  )
+```
+
+
+
+## plot of coverage for all scenarios
+
+```{r}
+coverage_df <- expand.grid(visits=c(0,4,8),N=c(50,100,200),rho=c(0.3,0.6),
+                           scenario=1:4)
+coverage_df$coverage <- as.vector(apply(sce_para,1,function(x)
+  {
+  tmp=assess_results(type="comp",N=as.numeric(x["N"]),rho=as.numeric(x["rho"]),hypothesis = x["hypothesis"])
+  return(as.numeric(tmp[1,]))
+}))
+coverage_df$sd <- 0.002
+coverage_df$scenario <- factor(coverage_df$scenario,levels = 1:4,
+                            labels = c("Null","SID","Increasing","Constant"))
+coverage_df$rho_f <- factor(coverage_df$rho,
+                             levels=c(0.3,0.6),
+                             labels=c(TeX("$\\rho$ = 0.3"),TeX("$\\rho$ = 0.6")))
+ggplot(coverage_df,aes(x=visits,y=coverage,group=factor(N),color=factor(N)))+
+  facet_grid(rho_f~scenario,labeller = label_parsed)+
+  geom_line()+
+  geom_point()+
+  labs(color="Sample size"
+       #,title = "Monte Carlo standard error = 0.002 (10,000 simulations)"
+       )+
+  theme_bw()+
+  ylim(c(0.92,0.96))+
+   geom_errorbar(aes(ymin=coverage-1.96*sd, ymax=coverage+1.96*sd), width=.2,
+                 position=position_dodge(0.05))+
+  geom_hline(yintercept = 0.95,linetype=2,color="coral")+
+  labs(x="Visit (week)",y="Coverage probability")+
+  scale_color_manual(values = c("#B395BD","#7DAEE0","#EA8379"))+
+  scale_x_continuous(breaks = c(0,4,8))+
+  theme(
+    legend.position = "bottom"
+  )
+```
+
