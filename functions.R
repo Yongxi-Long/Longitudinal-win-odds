@@ -9,10 +9,14 @@
 # visits: visit times
 # corMatrix: correlation matrix for within-subject dependency
 #' @import simstudy
+require(simstudy)
 gen_data <- function(N,baseprobs,covs_effects_baseline,
                      time_effect,trt_effect,time_trt_interaction,
                      visits,corMatrix)
 {
+  if (!requireNamespace("simstudy", quietly = TRUE)) {
+    stop("Package 'simstudy' is required but not installed.")
+  }
   # calculate marginal probabilities for trt/control at each visit, without covariate effects
   probs_control_allvisits <- lapply(visits,function(visit)
   {
@@ -30,29 +34,29 @@ gen_data <- function(N,baseprobs,covs_effects_baseline,
   # define covariate distribution
   # 2 prognostic covariates
   # age, mean 60 sd 10, from SID-GBS trial
-  def <- defData(varname = "age",dist = "normal",formula = 60,variance = 10^2)
+  def <- simstudy::defData(varname = "age",dist = "normal",formula = 60,variance = 10^2)
   # 40% patients have preceding diarrhea, from SID-GBS trial
-  def <- defData(def,"pre_diarrhea",dist = "binomial",formula = 0.4,variance = 1)
+  def <- simstudy::defData(def,"pre_diarrhea",dist = "binomial",formula = 0.4,variance = 1)
   # 1:1 randomization
-  def <- defData(def,varname = "trt",dist = "trtAssign",formula = "1;1")
+  def <- simstudy::defData(def,varname = "trt",dist = "trtAssign",formula = "1;1")
   # relationship specification, for continuous variables, mean-centered
-  def <- defData(def,varname = "z",
-                 formula = paste0(
-                                  ifelse(covs_effects_baseline['age']>=0,"+",""),covs_effects_baseline['age'],'*age',
-                                  ifelse(covs_effects_baseline['pre_diarrhea']>=0,"+",""),covs_effects_baseline['pre_diarrhea'],'*pre_diarrhea'),
-                 dist="nonrandom")
-  data_cov <- genData(N,def)
+  def <- simstudy::defData(def,varname = "z",
+                           formula = paste0(
+                             ifelse(covs_effects_baseline['age']>=0,"+",""),covs_effects_baseline['age'],'*age',
+                             ifelse(covs_effects_baseline['pre_diarrhea']>=0,"+",""),covs_effects_baseline['pre_diarrhea'],'*pre_diarrhea'),
+                           dist="nonrandom")
+  data_cov <- simstudy::genData(N,def)
   data_cov$age <- round(data_cov$age,0)
   data_trt_cov <- data_cov[data_cov$trt==1,]
-  data_trt <- genOrdCat(data_trt_cov,adjVar = "z",
-                        baseprobs = matrix(unlist(probs_trt_allvisits),byrow = TRUE,ncol = length(baseprobs)),
-                        corMatrix = corMatrix,
-                        prefix = "visit",asFactor = FALSE)
+  data_trt <- simstudy::genOrdCat(data_trt_cov,adjVar = "z",
+                                  baseprobs = matrix(unlist(probs_trt_allvisits),byrow = TRUE,ncol = length(baseprobs)),
+                                  corMatrix = corMatrix,
+                                  prefix = "visit",asFactor = FALSE)
   data_control_cov <- data_cov[data_cov$trt==0,]
-  data_control <- genOrdCat(data_control_cov,adjVar = "z",
-                            baseprobs = matrix(unlist(probs_control_allvisits),byrow = TRUE,ncol = length(baseprobs)),
-                            corMatrix = corMatrix,
-                            prefix = "visit",asFactor = FALSE)
+  data_control <- simstudy::genOrdCat(data_control_cov,adjVar = "z",
+                                      baseprobs = matrix(unlist(probs_control_allvisits),byrow = TRUE,ncol = length(baseprobs)),
+                                      corMatrix = corMatrix,
+                                      prefix = "visit",asFactor = FALSE)
   data_wide <- rbind(data_trt,data_control)
   data_wide <- data_wide[order(data_wide$id),]
   # combine and convert to long format
@@ -109,7 +113,7 @@ calculate_win_odds_one_visit <- function(p0,p1)
   return(c("true win probability"=WP_true,"true win odds"=WO_true))
 }
 calculate_win_odds_multiple_visits <-  function(baseprobs,conditional_effect,
-                                              time_effect,trt_effect,time_trt_interaction,visits)
+                                                time_effect,trt_effect,time_trt_interaction,visits)
 {
   res <- sapply(visits,function(visit)
   {
@@ -125,7 +129,7 @@ calculate_win_odds_multiple_visits <-  function(baseprobs,conditional_effect,
 }
 # use large simulated sample to marginal out the covariate distribution
 calculate_adjusted_win_odds_multiple_visits <-  function(N_approx,baseprobs,covs_effects_baseline,
-                                              time_effect,trt_effect,time_trt_interaction,visits)
+                                                         time_effect,trt_effect,time_trt_interaction,visits)
 {
   dat_full <- gen_data(N_approx,baseprobs,covs_effects_baseline,
                        time_effect,trt_effect,time_trt_interaction,
@@ -137,7 +141,7 @@ calculate_adjusted_win_odds_multiple_visits <-  function(N_approx,baseprobs,covs
   table_z$freq <- table_z$count/sum(table_z$count)
   wos_conditional=sapply(table_z$conditional_effect, function(i)
     calculate_win_odds_multiple_visits(baseprobs,conditional_effect=i,
-                                     time_effect,trt_effect,time_trt_interaction,visits)
+                                       time_effect,trt_effect,time_trt_interaction,visits)
   )
   # weigh each conditional win odds w.r.t the strata frequency to get marginal win odds
   wos_marginal <- apply(wos_conditional, 1, function(x) t(c(x))%*%c(table_z$freq))
