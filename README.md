@@ -11,4 +11,4 @@ LWO_simulation.R: script for running the simulation.
 
 LWO_results_assess.Rmd: The script sets up the simulation scenarios and evaluates the simulation results.
 
-MC_simulation_shark.R: script for running the simulation in cloud computation.
+LWO_simulation_cloud.R: script for running the simulation in cloud computation.
